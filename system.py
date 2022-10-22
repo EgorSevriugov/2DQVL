@@ -7,6 +7,7 @@ import io
 import imageio
 from torchdyn.core import NeuralODE
 import matplotlib as mpl
+import torch.multiprocessing as mp
 np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
 
 class System(torch.nn.Module):
@@ -55,11 +56,11 @@ class System(torch.nn.Module):
         self.theta = torch.tensor([theta],device=device)
         self.target = torch.tensor(target,device=device)
         self.device=device
-    def wind_acceleration(self,wind):
-        target_v = (torch.rand((1),device=self.device)*(self.wind_limits[1]-self.wind_limits[0]) + self.wind_limits[0]) * torch.sign(wind)
+    def wind_acceleration(self, wind):
         if self.wind_limits[1] - self.wind_limits[0] <= 1e-6:
             acceleration = torch.zeros_like(wind)
         else:
+            target_v = (torch.rand_like(wind)*(self.wind_limits[1]-self.wind_limits[0]) + self.wind_limits[0]) * torch.sign(wind)
             acceleration = (target_v - wind) / (self.wind_limits[1] - self.wind_limits[0]) * self.wind_acceleration_scale
         return acceleration
     def x_check_in_block(self,c_x,phi,x,w):
@@ -82,7 +83,7 @@ class System(torch.nn.Module):
     def check_pass_block(self,c_x,phi,x,w):
         c_x, phi, x, w = c_x.item(), phi.item(), x.item(), w.item()
         return c_x+self.l[0]*np.cos(phi)/2+self.l[1]*np.sin(np.abs(phi))/2 < x-w/2
-    def get_observation(self, state):
+    def get_observation_single(self, state):
         c_x, c_y, v_x, _, phi, _, _ = state
         c_x, c_y, v_x, phi = c_x[None],c_y[None],v_x[None],phi[None]
         d_1 = None
@@ -106,7 +107,58 @@ class System(torch.nn.Module):
         if d_2 is None:
             d_2 = 15 - c_x
         return torch.cat([d_1,d_2,up,down,v_x,phi])
-    def get_reward(self,state,action):
+    
+    def x_check_in_block_batch(self,c_x,cos_phi,sin_phi,x,w):
+        return torch.logical_or(
+            torch.logical_and(x-w/2 <= c_x + cos_phi*self.l[0]/2 + sin_phi*self.l[1]/2,
+                              x-w/2 >= c_x - cos_phi*self.l[0]/2 - sin_phi*self.l[1]/2),
+            torch.logical_and(x+w/2 <= c_x + cos_phi*self.l[0]/2 + sin_phi*self.l[1]/2,
+                              x+w/2 >= c_x - cos_phi*self.l[0]/2 - sin_phi*self.l[1]/2)
+        )
+    def y1_check_in_block_batch(self,c_y,cos_phi,sin_phi,y,h,d):
+        return torch.logical_or(c_y - sin_phi*self.l[0]/2 - cos_phi*self.l[1]/2 < y-h/2, 
+                                c_y - sin_phi*self.l[0]/2 - cos_phi*self.l[1]/2 > y+h/2) * d.isnan()
+    def y2_check_in_block_batch(self,c_y,cos_phi,sin_phi,y,h,d):
+        return torch.logical_or(c_y + sin_phi*self.l[0]/2 + cos_phi*self.l[1]/2 > y+h/2,
+                                 c_y + sin_phi*self.l[0]/2 + cos_phi*self.l[1]/2 < y-h/2) * d.isnan()
+    def check_pass_block_batch(self,c_x,cos_phi,sin_phi,x,w):
+        return c_x + cos_phi*self.l[0]/2 + sin_phi*self.l[1]/2 < x-w/2
+    def get_observation_batch(self, state):
+        state = state[None] if state.ndim == 1 else state
+        c_x, c_y, v_x, _, phi, _, _  = map(lambda t: t.view(-1, 1), state.transpose(0, 1))
+        cos_phi, sin_phi = torch.cos(phi), torch.sin(torch.abs(phi))
+
+        d_1 = torch.full_like(c_x, fill_value=torch.nan)
+        d_2 = torch.full_like(c_x, fill_value=torch.nan)
+        up = self.y_limits[1] - c_y
+        down = c_y - self.y_limits[0]
+        for i,block in enumerate(self.blocks):
+            x,y,w,h = block
+
+            x_in_block = self.x_check_in_block_batch(c_x,cos_phi,sin_phi,x,w)
+            up[x_in_block] = y+h/2 - c_y[x_in_block]
+            down[x_in_block] = c_y[x_in_block] - (y-h/2)
+
+            pass_block = self.check_pass_block_batch(c_x,cos_phi,sin_phi,x,w)
+            if torch.any(pass_block):
+                y1_in_block = pass_block * self.y1_check_in_block_batch(c_y,cos_phi,sin_phi,y,h,d_1)
+                d_1[y1_in_block] = (x - w/2 - c_x - cos_phi*self.l[0]/2 - sin_phi*self.l[1]/2)[y1_in_block]
+
+                y2_in_block = pass_block * self.y2_check_in_block_batch(c_y,cos_phi,sin_phi,y,h,d_2)
+                d_2[y2_in_block] = (x - w/2 - c_x - cos_phi*self.l[0]/2 - sin_phi*self.l[1]/2)[y2_in_block]
+
+        d_1[d_1.isnan()] = 15 - c_x[d_1.isnan()]
+        d_2[d_2.isnan()] = 15 - c_x[d_2.isnan()]
+
+        return torch.cat([d_1,d_2,up,down,v_x,phi], dim=1).squeeze(0)
+    
+    def get_observation(self, state):
+        if state.ndim == 1:
+            return self.get_observation_single(state)
+        else:
+            return self.get_observation_batch(state)
+    
+    def get_reward_single(self,state,action):
         c_x, c_y, v_x, v_y, phi, theta, wind = state
         u_1, u_2 = action
         c_x, c_y, v_x, v_y, phi, theta, wind, u_1, u_2 = c_x[None], c_y[None], v_x[None], v_y[None], phi[None], theta[None], wind[None], u_1[None], u_2[None]
@@ -118,8 +170,32 @@ class System(torch.nn.Module):
             if self.x_check_in_block(c_x,phi,x,w):
                 up = y+h/2 - c_y - self.l[0]*torch.sin(torch.abs(phi))/2 - self.l[1]*torch.cos(phi)/2
                 down = c_y - (y-h/2) - self.l[0]*torch.sin(torch.abs(phi))/2 - self.l[1]*torch.cos(phi)/2
-        reward_collision = 0.5*torch.nn.Sigmoid()(-50*up) + 0.5*torch.nn.Sigmoid()(-50*down)
+        reward_collision = 0.5*(torch.sigmoid(-50*up) + torch.sigmoid(-50*down))
         return (-10) * reward_target + (-30) * reward_collision
+    
+    def get_reward_batch(self,state,action):
+        state, action = map(lambda t: t[None] if t.ndim == 1 else t, (state,action))
+        c_x, c_y, v_x, v_y, phi, theta, wind = map(lambda t: t.view(-1, 1), state.transpose(0, 1))
+        u_1, u_2 = map(lambda t: t.view(-1, 1), action.transpose(0, 1))
+        cos_phi, sin_phi = torch.cos(phi), torch.sin(torch.abs(phi))
+
+        reward_target = 0.5*(c_x - self.target[0])**2 / (self.x_limits[1] - self.x_limits[0])**2 + 0.5*(c_y - self.target[1])**2 / (self.y_limits[1] - self.y_limits[0])**2
+        up = self.y_limits[1] - c_y - self.l[0]*torch.sin(torch.abs(phi))/2 - cos_phi*self.l[1]/2
+        down = c_y - self.y_limits[0] - self.l[0]*torch.sin(torch.abs(phi))/2 - cos_phi*self.l[1]/2
+        for i,block in enumerate(self.blocks):
+            x,y,w,h = block
+            x_in_block = self.x_check_in_block_batch(c_x,cos_phi,sin_phi,x,w)
+            up[x_in_block] = (y+h/2 - c_y - sin_phi*self.l[0]/2 - cos_phi*self.l[1]/2)[x_in_block]
+            down[x_in_block] = (c_y - (y-h/2) - sin_phi*self.l[0]/2 - cos_phi*self.l[1]/2)[x_in_block]
+        reward_collision = 0.5*(torch.sigmoid(-50*up) + torch.sigmoid(-50*down))
+        reward = (-10) * reward_target + (-30) * reward_collision
+        return reward.squeeze(0)
+    
+    def get_reward(self,state,action):
+        if state.ndim == 1:
+            return self.get_reward_single(state, action)
+        else:
+            return self.get_reward_batch(state, action)
         
     def visualize_reward(self, state, action):
         dim_x = self.x_limits[1]-self.x_limits[0]
@@ -127,12 +203,16 @@ class System(torch.nn.Module):
         fig = plt.figure(figsize=(dim_x*4,dim_y*4))
 #         plt.subplot(1,2,1)
         axes = plt.gca()
+        
         scale = 5
-        result = torch.zeros((int(dim_y*4*scale),int(dim_x*4*scale)))
-        for i,c_x in enumerate(torch.linspace(self.x_limits[0],self.x_limits[1],int(dim_x*4*scale),device=self.device)):
-            for j,c_y in enumerate(torch.linspace(self.y_limits[1],self.y_limits[0],int(dim_y*4*scale),device=self.device)):
-                state = torch.cat([c_x[None],c_y[None],state[2:]])
-                result[j,i] = self.get_reward(state,action)
+        num_x, num_y = int(dim_x*4*scale), int(dim_y*4*scale)
+        c_xs = torch.linspace(self.x_limits[0],self.x_limits[1],num_x,device=self.device).repeat(num_y)
+        c_ys = torch.linspace(self.y_limits[1],self.y_limits[0],num_y,device=self.device).repeat_interleave(num_x)
+        all_states = state[None].repeat(num_x * num_y, 1)
+        all_states[:, 0] = c_xs
+        all_states[:, 1] = c_ys
+        result = self.get_reward(all_states,action).view(num_y, num_x)
+        
         im = axes.imshow(result,cmap=mpl.colormaps["viridis"])
         _ = plt.xticks([])
         _ = plt.yticks([])
@@ -249,24 +329,25 @@ class DynamicSystem(torch.nn.Module):
             action = self.actor(self.get_observation(state)) if action is None else action
             next_state = self.make_transition(state,action) if next_state is None else next_state
             target = self.get_reward(state,action) + self.discount_factor * self.critic(self.get_observation(next_state))
-        return torch.nn.MSELoss()(self.critic(self.get_observation(state)),target)
+        return torch.nn.MSELoss(reduction='none')(self.critic(self.get_observation(state)),target)
     def actor_loss(self,state,action=None,next_state=None):
         state = state.detach()
         action = self.actor(self.get_observation(state)) if action is None else action
         next_state = self.make_transition(state,action) if next_state is None else next_state
-        return -(self.get_reward(state,action) + self.critic(self.get_observation(next_state)))
+        return -(self.get_reward(state,action) + self.discount_factor * self.critic(self.get_observation(next_state)))
     def make_transition(self,state,action):
-        state_action = self.ode(torch.cat([state,action]), torch.linspace(0,self.sampling_time,2,device=self.device))[1][-1]
-        c_x, c_y, v_x, v_y, phi, theta, wind = state_action[:-2]
-        c_x, c_y, v_x, v_y, phi, theta, wind = c_x[None], c_y[None], v_x[None], v_y[None], phi[None], theta[None], wind[None]
-        
-        x_lim = [self.system.x_limits[0]+self.system.l[0]/2*torch.cos(phi)+self.system.l[1]/2*torch.sin(torch.abs(phi)),
-                 self.system.x_limits[1]-self.system.l[0]/2*torch.cos(phi)-self.system.l[1]/2*torch.sin(torch.abs(phi))]
-        y_lim = [self.system.y_limits[0]+self.system.l[0]/2*torch.sin(torch.abs(phi))+self.system.l[1]/2*torch.cos(phi),
-                 self.system.y_limits[1]-self.system.l[0]/2*torch.sin(torch.abs(phi))-self.system.l[1]/2*torch.cos(phi)]
-        phi_lim = [-np.pi/2,np.pi/2]
+        state, action = map(lambda t: t[None] if t.ndim == 1 else t, (state,action))
+        state_action = self.ode(torch.cat([state, action], dim=1), torch.linspace(0,self.sampling_time,2,device=self.device))[1][-1]
+        c_x, c_y, v_x, v_y, phi, theta, wind = map(lambda t: t.view(-1, 1), state_action.transpose(0, 1)[:-2])
+        cos_phi, sin_phi = torch.cos(phi), torch.sin(torch.abs(phi))
+
+        x_lim = [self.system.x_limits[0]+self.system.l[0]/2*cos_phi+self.system.l[1]/2*sin_phi,
+                 self.system.x_limits[1]-self.system.l[0]/2*cos_phi-self.system.l[1]/2*sin_phi]
+        y_lim = [self.system.y_limits[0]+self.system.l[0]/2*sin_phi+self.system.l[1]/2*cos_phi,
+                 self.system.y_limits[1]-self.system.l[0]/2*sin_phi-self.system.l[1]/2*cos_phi]
+        phi_lim = [-torch.pi/2,torch.pi/2]
         c_x, c_y, phi = c_x.clamp(*x_lim), c_y.clamp(*y_lim), phi.clamp(*phi_lim)
-        return torch.cat([c_x, c_y, v_x, v_y, phi, theta, wind])
+        return torch.cat([c_x, c_y, v_x, v_y, phi, theta, wind], dim=1).squeeze(0)
     def calc_total_reward(self):
         state = self.system.init_state()
         t = 0
@@ -279,16 +360,20 @@ class DynamicSystem(torch.nn.Module):
 
             t += self.sampling_time
         return reward
-    def visualize_episode(self,save_path="./episode.gif"):
+    def visualize_episode(self,save_path="./episode.gif",num_workers=4):
         state = self.system.init_state()
         t = 0
-        images = []
+        state_actions = []
         while t <= self.total_time:
             with torch.no_grad():
                 action = self.actor(self.system.get_observation(state))
-            images.append(self.system.visualize_state(state,action))
-            
-            state = self.make_transition(state, action)
-
+                state_actions.append((state, action))
+                state = self.make_transition(state, action)
             t += self.sampling_time
+
+        if num_workers > 1:
+            with mp.Pool(num_workers) as pool:
+                images = pool.starmap(self.system.visualize_state, state_actions)
+        else:
+            images = [self.system.visualize_state(state, action) for state, action in state_actions]
         imageio.mimsave(save_path, images, fps=int(len(images)/self.total_time))
