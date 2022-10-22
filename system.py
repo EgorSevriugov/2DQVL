@@ -213,17 +213,18 @@ class System(torch.nn.Module):
         return img
             
     def init_state(self):
-        wind_sign = np.sign(np.random.uniform(low=-1,high=1,size=(1)))
+        wind_sign = (torch.rand(1, device=self.device) > 0.5).double()
         return torch.cat([self.c_x,self.c_y,self.v_x,self.v_y,self.phi,self.theta, (self.wind_limits[0]+self.wind_limits[1])/2 * wind_sign])
     
     def forward(self,state_action):
-        c_x, c_y, v_x, v_y, phi, theta, wind, u_1, u_2 = state_action
-        c_x, c_y, v_x, v_y, phi, theta, wind, u_1, u_2 = c_x[None], c_y[None], v_x[None], v_y[None], phi[None], theta[None], wind[None], u_1[None], u_2[None]
-        
+        state_action = state_action[None] if state_action.ndim == 1 else state_action
+        c_x, c_y, v_x, v_y, phi, theta, wind, u_1, u_2 = map(lambda t: t.view(-1, 1), state_action.transpose(0, 1))
+
         d_v_x = -self.g*(u_1 + u_2) * torch.sin(phi) + torch.sign(wind) * self.C * ((wind-v_x)**2) * (self.l[0] * torch.sin(torch.abs(phi)) + self.l[1]*torch.cos(phi))*self.l[2]
         d_v_y = self.g*(u_1 + u_2) * torch.cos(phi) - self.g
-        
-        return torch.cat([v_x, v_y, d_v_x, d_v_y, theta, self.R * (u_2-u_1),self.wind_acceleration(wind),torch.zeros_like(u_1),torch.zeros_like(u_2)])
+
+        return torch.cat([v_x, v_y, d_v_x, d_v_y, theta, self.R * (u_2-u_1), self.wind_acceleration(wind), torch.zeros_like(u_1), torch.zeros_like(u_2)], dim=1).squeeze(0)
+
     
 class DynamicSystem(torch.nn.Module):
     def __init__(self, system, actor, critic, sampling_time=0.05, total_time=10, discount_factor=1., device="cpu"):
@@ -242,25 +243,27 @@ class DynamicSystem(torch.nn.Module):
         return self.system.get_observation(state)
     def get_reward(self,state,action):
         return self.system.get_reward(state,action)
-    def critic_loss(self,state):
+    def critic_loss(self,state,action=None,next_state=None):
         state = state.detach()
         with torch.no_grad():
-            action = self.actor(self.get_observation(state))
-            next_state = self.make_transition(state,action)
+            action = self.actor(self.get_observation(state)) if action is None else action
+            next_state = self.make_transition(state,action) if next_state is None else next_state
             target = self.get_reward(state,action) + self.discount_factor * self.critic(self.get_observation(next_state))
         return torch.nn.MSELoss()(self.critic(self.get_observation(state)),target)
-    def actor_loss(self,state):
+    def actor_loss(self,state,action=None,next_state=None):
         state = state.detach()
-        action = self.actor(self.get_observation(state))
-        next_state = self.make_transition(state,action)
+        action = self.actor(self.get_observation(state)) if action is None else action
+        next_state = self.make_transition(state,action) if next_state is None else next_state
         return -(self.get_reward(state,action) + self.critic(self.get_observation(next_state)))
     def make_transition(self,state,action):
-        state_action = self.ode(torch.cat([state,action]), torch.linspace(0,self.sampling_time,2).to(self.device))[1][-1]
+        state_action = self.ode(torch.cat([state,action]), torch.linspace(0,self.sampling_time,2,device=self.device))[1][-1]
         c_x, c_y, v_x, v_y, phi, theta, wind = state_action[:-2]
         c_x, c_y, v_x, v_y, phi, theta, wind = c_x[None], c_y[None], v_x[None], v_y[None], phi[None], theta[None], wind[None]
         
-        x_lim = [self.system.x_limits[0]+self.system.l[0]/2*np.cos(phi)+self.system.l[1]/2*np.sin(np.abs(phi)),self.system.x_limits[1]-self.system.l[0]/2*np.cos(phi)-self.system.l[1]/2*np.sin(np.abs(phi))]
-        y_lim = [self.system.y_limits[0]+self.system.l[0]/2*np.sin(np.abs(phi))+self.system.l[1]/2*np.cos(phi),self.system.y_limits[1]-self.system.l[0]/2*np.sin(np.abs(phi))-self.system.l[1]/2*np.cos(phi)]
+        x_lim = [self.system.x_limits[0]+self.system.l[0]/2*torch.cos(phi)+self.system.l[1]/2*torch.sin(torch.abs(phi)),
+                 self.system.x_limits[1]-self.system.l[0]/2*torch.cos(phi)-self.system.l[1]/2*torch.sin(torch.abs(phi))]
+        y_lim = [self.system.y_limits[0]+self.system.l[0]/2*torch.sin(torch.abs(phi))+self.system.l[1]/2*torch.cos(phi),
+                 self.system.y_limits[1]-self.system.l[0]/2*torch.sin(torch.abs(phi))-self.system.l[1]/2*torch.cos(phi)]
         phi_lim = [-np.pi/2,np.pi/2]
         c_x, c_y, phi = c_x.clamp(*x_lim), c_y.clamp(*y_lim), phi.clamp(*phi_lim)
         return torch.cat([c_x, c_y, v_x, v_y, phi, theta, wind])
@@ -281,7 +284,8 @@ class DynamicSystem(torch.nn.Module):
         t = 0
         images = []
         while t <= self.total_time:
-            action = self.actor(self.system.get_observation(state))
+            with torch.no_grad():
+                action = self.actor(self.system.get_observation(state))
             images.append(self.system.visualize_state(state,action))
             
             state = self.make_transition(state, action)
