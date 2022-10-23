@@ -112,7 +112,7 @@ class System(torch.nn.Module):
         u_1, u_2 = action.t()
         vert_dist = torch.cat([up[None],down[None]],dim=0).min(0)[0].clamp(0,10)
         hori_dist = torch.cat([d_1[None],d_2[None]],dim=0).min(0)[0]
-        reward_target = (-1.5) * (d_target)**2 / (self.x_limits[1] - self.x_limits[0])**2
+        reward_target = (-1) * (d_target)**2 / (self.x_limits[1] - self.x_limits[0])**2
         reward_collision = (-10)*torch.nn.Sigmoid()(-1000*(vert_dist-0.001)) + (-10)*torch.nn.Sigmoid()(-1000*(hori_dist-0.001))
         return reward_target + reward_collision
         

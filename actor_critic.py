@@ -134,12 +134,12 @@ class ActorCriticTrainer:
                 with torch.no_grad():
                     next_state = state
                     reward = 0
-                    for semi in range(4):
+                    for semi in range(2):
                         action = actor(dynamics.system.get_observation(next_state))
-                        reward += dynamics.system.get_reward(next_state,action)
+                        reward += dynamics.system.get_reward(next_state,action) * dynamics.discount_factor**semi
                         
                         next_state = dynamics.make_transition(next_state, action)
-                    target = reward[:,None] + dynamics.discount_factor * critic(dynamics.get_observation(next_state))
+                    target = reward[:,None] + (dynamics.discount_factor**(semi+1)) * critic(dynamics.get_observation(next_state))
                 critic_loss = torch.nn.MSELoss()(critic(dynamics.get_observation(state)),target)
 
                 critic_optimizer.zero_grad()
@@ -168,7 +168,7 @@ class ActorCriticTrainer:
                 if i % 10 == 0:
                     pbar.set_description(
                         f"Iteration {i}"
-                        f"Loss {round(critic_loss.item())}"
+                        f"Loss {round(actor_loss.item())}"
                     )
 
         self.total_iterations += iterations
