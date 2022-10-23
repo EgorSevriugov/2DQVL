@@ -12,7 +12,7 @@ class Scale(torch.nn.Module):
         self.factor = factor
 
     def forward(self, input):
-        return input * self.factor
+        return input * self.factor/2 + self.factor/2
 
     def extra_repr(self):
         return f'factor={self.factor}'
@@ -21,7 +21,7 @@ class Scale(torch.nn.Module):
 class Actor(torch.nn.Module):
     def __init__(
             self,
-            num_observations: int = 6,
+            num_observations: int = 7,
             num_actions: int = 2,
             dim: int = 32,
             depth: int = 3
@@ -39,15 +39,15 @@ class Actor(torch.nn.Module):
         self.net = torch.nn.Sequential(*modules)
 
     def forward(self, observation):
-        x = observation.unsqueeze(0) if observation.ndim == 1 else observation
-        out = self.net(x).squeeze(0)
+        x = observation
+        out = self.net(x)
         return out
 
 
 class Critic(torch.nn.Module):
     def __init__(
             self,
-            num_observations: int = 6,
+            num_observations: int = 7,
             dim: int = 32,
             depth: int = 3,
             scale: float = 1.
@@ -62,14 +62,15 @@ class Critic(torch.nn.Module):
             ))
             if i < depth - 1:
                 modules.append(torch.nn.LeakyReLU())
+        modules.append(torch.nn.Tanh())
         modules.append(Scale(scale))
 
         self.net = torch.nn.Sequential(*modules)
 
     def forward(self, observation):
-        x = observation.unsqueeze(0) if observation.ndim == 1 else observation
-        x = self.net(x).squeeze(0)
-        out = -(x ** 2)
+        x = observation
+        x = self.net(x)
+        out = -x
         return out
 
 
@@ -105,7 +106,10 @@ class ActorCriticTrainer:
     def run(
             self,
             iterations: int = 10,
-            episodes: int = 1,
+            actor_subiters: int = 1,
+            critic_subiters: int = 20,
+            critic_batch_size: int = 1000,
+            actor_batch_size: int = 4000,
             grad_clip_norm: Optional[float] = None,
             verbose: bool = False
     ):
@@ -120,66 +124,45 @@ class ActorCriticTrainer:
         training_history = defaultdict(list)
 
         for iteration in range(self.total_iterations, self.total_iterations + iterations):
-            actor_losses, critic_losses, rewards = [], [], []
-            for episode in range(episodes):
-                episode_actor_loss, episode_critic_loss, episode_reward = 0., 0., 0.
-
-                t = 0
-                state = dynamics.system.init_state()
-                while t <= dynamics.total_time:
+            critic_losses = 0
+            actor_losses = 0
+            for i in range(critic_subiters):
+                
+                state = dynamics.system.sample_state(critic_batch_size)
+                with torch.no_grad():
                     action = actor(dynamics.system.get_observation(state))
                     next_state = dynamics.make_transition(state, action)
+                    
+                critic_loss = dynamics.critic_loss(state, action, next_state)
+                
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                if grad_clip_norm is not None:
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic.parameters(), grad_clip_norm)
+                critic_optimizer.step()
+                critic_losses += critic_loss.item() / critic_subiters
+            for i in range(actor_subiters):
+                state = dynamics.system.sample_state(actor_batch_size)
+                
+                action = actor(dynamics.system.get_observation(state))
+                next_state = dynamics.make_transition(state, action)
+                actor_loss = dynamics.actor_loss(state, action, next_state)
 
-                    episode_actor_loss += dynamics.actor_loss(state, action=action, next_state=next_state)
-                    episode_critic_loss += dynamics.critic_loss(state, action=action, next_state=next_state)
-                    episode_reward += dynamics.get_reward(state, action).item()
-
-                    state = next_state.detach()
-                    t += dynamics.sampling_time
-
-                steps = dynamics.total_time / dynamics.sampling_time
-                episode_actor_loss /= steps
-                episode_critic_loss /= steps
-
-                if episodes > 1 and verbose:
-                    print(f'Episode {episode + 1:3d}/{episodes}: '
-                          f'actor_loss={episode_actor_loss.item():.4f}, '
-                          f'critic_loss={episode_critic_loss.item():.4f}, '
-                          f'reward={episode_reward:.4f}')
-
-                actor_losses.append(episode_actor_loss)
-                critic_losses.append(episode_critic_loss)
-                rewards.append(episode_reward)
-
-            actor_loss = torch.stack(actor_losses).mean()
-            critic_loss = torch.stack(critic_losses).mean()
-            reward = sum(rewards) / len(rewards)
-
-            actor_optimizer.zero_grad()
-            actor_loss.backward()
-            if grad_clip_norm is not None:
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip_norm)
-            actor_optimizer.step()
-
-            critic_optimizer.zero_grad()
-            critic_loss.backward()
-            if grad_clip_norm is not None:
-                critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic.parameters(), grad_clip_norm)
-            critic_optimizer.step()
-
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                if grad_clip_norm is not None:
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip_norm)
+                actor_optimizer.step()
+                actor_losses += actor_loss.item() / actor_subiters
             if verbose:
                 print(f'Iteration {iteration + 1:3d}/{self.total_iterations + iterations}: '
-                      f'actor_loss={actor_loss.item():.4f}, '
-                      f'critic_loss={critic_loss.item():.4f}, '
-                      f'reward={reward:.4f}'
+                      f'actor_loss={actor_losses:.4f}, '
+                      f'critic_loss={critic_losses:.4f}, '
                       + (f', actor_grad_norm={actor_grad_norm:.4f}' if actor_grad_norm is not None else '')
                       + (f', critic_grad_norm={critic_grad_norm:.4f}' if critic_grad_norm is not None else ''))
-                if episodes > 1:
-                    print()
 
-            training_history['actor_loss'].append(actor_loss.item())
-            training_history['critic_loss'].append(critic_loss.item())
-            training_history['reward'].append(reward)
+            training_history['actor_loss'].append(actor_losses)
+            training_history['critic_loss'].append(critic_losses)
 
         self.total_iterations += iterations
 
