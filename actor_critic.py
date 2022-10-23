@@ -4,6 +4,8 @@ from typing import Optional, Union, Type, Dict
 import torch
 
 from system import DynamicSystem
+import numpy as np
+from tqdm import tqdm
 
 
 class Scale(torch.nn.Module):
@@ -12,7 +14,7 @@ class Scale(torch.nn.Module):
         self.factor = factor
 
     def forward(self, input):
-        return input * self.factor/2 + self.factor/2
+        return input * self.factor
 
     def extra_repr(self):
         return f'factor={self.factor}'
@@ -21,7 +23,7 @@ class Scale(torch.nn.Module):
 class Actor(torch.nn.Module):
     def __init__(
             self,
-            num_observations: int = 7,
+            num_observations: int = 8,
             num_actions: int = 2,
             dim: int = 32,
             depth: int = 3
@@ -34,20 +36,20 @@ class Actor(torch.nn.Module):
                 num_observations if i == 0 else dim,
                 num_actions if i == depth - 1 else dim
             ))
-            modules.append(torch.nn.LeakyReLU() if i < depth - 1 else torch.nn.Sigmoid())
+            modules.append(torch.nn.LeakyReLU() if i < depth - 1 else torch.nn.Identity())
 
         self.net = torch.nn.Sequential(*modules)
 
     def forward(self, observation):
         x = observation
-        out = self.net(x)
+        out = torch.nn.Tanh()(self.net(x))*0.5 + 0.5
         return out
 
 
 class Critic(torch.nn.Module):
     def __init__(
             self,
-            num_observations: int = 7,
+            num_observations: int = 6,
             dim: int = 32,
             depth: int = 3,
             scale: float = 1.
@@ -68,7 +70,7 @@ class Critic(torch.nn.Module):
         self.net = torch.nn.Sequential(*modules)
 
     def forward(self, observation):
-        x = observation
+        x = observation[:,:-2]
         x = self.net(x)
         out = -x
         return out
@@ -102,14 +104,15 @@ class ActorCriticTrainer:
         else:
             critic_optimizer_params = critic_optimizer_params or {}
             self.critic_optimizer = critic_optimizer(self.critic.parameters(), **critic_optimizer_params)
+            
 
     def run(
             self,
             iterations: int = 10,
-            actor_subiters: int = 1,
-            critic_subiters: int = 20,
+            actor_subiters: int = 200,
+            critic_subiters: int = 1000,
             critic_batch_size: int = 1000,
-            actor_batch_size: int = 4000,
+            actor_batch_size: int = 1000,
             grad_clip_norm: Optional[float] = None,
             verbose: bool = False
     ):
@@ -124,24 +127,33 @@ class ActorCriticTrainer:
         training_history = defaultdict(list)
 
         for iteration in range(self.total_iterations, self.total_iterations + iterations):
-            critic_losses = 0
-            actor_losses = 0
-            for i in range(critic_subiters):
-                
+            pbar = tqdm(range(critic_subiters))
+            for i in pbar:
+
                 state = dynamics.system.sample_state(critic_batch_size)
                 with torch.no_grad():
-                    action = actor(dynamics.system.get_observation(state))
-                    next_state = dynamics.make_transition(state, action)
-                    
-                critic_loss = dynamics.critic_loss(state, action, next_state)
-                
+                    next_state = state
+                    reward = 0
+                    for semi in range(4):
+                        action = actor(dynamics.system.get_observation(next_state))
+                        reward += dynamics.system.get_reward(next_state,action)
+                        
+                        next_state = dynamics.make_transition(next_state, action)
+                    target = reward[:,None] + dynamics.discount_factor * critic(dynamics.get_observation(next_state))
+                critic_loss = torch.nn.MSELoss()(critic(dynamics.get_observation(state)),target)
+
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
                 if grad_clip_norm is not None:
                     critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic.parameters(), grad_clip_norm)
                 critic_optimizer.step()
-                critic_losses += critic_loss.item() / critic_subiters
-            for i in range(actor_subiters):
+                if i % 10 == 0:
+                    pbar.set_description(
+                        f"Iteration {i}"
+                        f"Loss {round(critic_loss.item())}"
+                    )
+            pbar = tqdm(range(actor_subiters))
+            for i in pbar:
                 state = dynamics.system.sample_state(actor_batch_size)
                 
                 action = actor(dynamics.system.get_observation(state))
@@ -153,16 +165,11 @@ class ActorCriticTrainer:
                 if grad_clip_norm is not None:
                     actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip_norm)
                 actor_optimizer.step()
-                actor_losses += actor_loss.item() / actor_subiters
-            if verbose:
-                print(f'Iteration {iteration + 1:3d}/{self.total_iterations + iterations}: '
-                      f'actor_loss={actor_losses:.4f}, '
-                      f'critic_loss={critic_losses:.4f}, '
-                      + (f', actor_grad_norm={actor_grad_norm:.4f}' if actor_grad_norm is not None else '')
-                      + (f', critic_grad_norm={critic_grad_norm:.4f}' if critic_grad_norm is not None else ''))
-
-            training_history['actor_loss'].append(actor_losses)
-            training_history['critic_loss'].append(critic_losses)
+                if i % 10 == 0:
+                    pbar.set_description(
+                        f"Iteration {i}"
+                        f"Loss {round(critic_loss.item())}"
+                    )
 
         self.total_iterations += iterations
 
