@@ -122,11 +122,11 @@ class System(torch.nn.Module):
         fig = plt.figure(figsize=(dim_x*4,dim_y*4))
         axes = plt.gca()
         scale = 5
-        result = torch.zeros((int(dim_y*4*scale),int(dim_x*4*scale)))
-        for i,c_x in enumerate(torch.linspace(self.x_limits[0],self.x_limits[1],int(dim_x*4*scale),device=self.device)):
-            for j,c_y in enumerate(torch.linspace(self.y_limits[1],self.y_limits[0],int(dim_y*4*scale),device=self.device)):
-                state = torch.cat([c_x[None],c_y[None],state[0][2:]])[None]
-                result[j,i] = self.get_reward(state,action)[0]
+        num_x, num_y = int(dim_x*4*scale), int(dim_y*4*scale)
+        all_states = state.repeat(num_x * num_y, 1)
+        all_states[:, 0] = torch.linspace(self.x_limits[0], self.x_limits[1], num_x, device=self.device).repeat(num_y)
+        all_states[:, 1] = torch.linspace(self.y_limits[1], self.y_limits[0], num_y, device=self.device).repeat_interleave(num_x)
+        result = self.get_reward(all_states, action).view(num_y, num_x)
         im = axes.imshow(result,cmap=mpl.colormaps["viridis"])
         _ = plt.xticks([])
         _ = plt.yticks([])
@@ -144,11 +144,12 @@ class System(torch.nn.Module):
         fig = plt.figure(figsize=(dim_x*4,dim_y*4))
         axes = plt.gca()
         scale = 5
-        result = torch.zeros((int(dim_y*4*scale),int(dim_x*4*scale)))
-        for i,c_x in enumerate(torch.linspace(self.x_limits[0],self.x_limits[1],int(dim_x*4*scale),device=self.device)):
-            for j,c_y in enumerate(torch.linspace(self.y_limits[1],self.y_limits[0],int(dim_y*4*scale),device=self.device)):
-                state = torch.cat([c_x[None],c_y[None],state[0][2:]])[None]
-                result[j,i] = critic(self.get_observation(state))[0].item()
+        num_x, num_y = int(dim_x*4*scale), int(dim_y*4*scale)
+        all_states = state.repeat(num_x * num_y, 1)
+        all_states[:, 0] = torch.linspace(self.x_limits[0], self.x_limits[1], num_x, device=self.device).repeat(num_y)
+        all_states[:, 1] = torch.linspace(self.y_limits[1], self.y_limits[0], num_y, device=self.device).repeat_interleave(num_x)
+        with torch.no_grad():
+            result = critic(self.get_observation(all_states)).view(num_y, num_x).cpu()
         im = axes.imshow(result,cmap=mpl.colormaps["viridis"])
         _ = plt.xticks([])
         _ = plt.yticks([])
