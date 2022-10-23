@@ -125,7 +125,7 @@ class System(torch.nn.Module):
                     up[j] = y+h/2 - c_y_ - self.l[0]*torch.sin(torch.abs(phi_))/2 - self.l[1]*torch.cos(phi_)/2
                     down[j] = c_y_ - (y-h/2) - self.l[0]*torch.sin(torch.abs(phi_))/2 - self.l[1]*torch.cos(phi_)/2
         reward_collision = torch.nn.Sigmoid()(-50*up) + torch.nn.Sigmoid()(-50*down)
-        return (-10) * reward_target + (-30+20*torch.cat([up[None],down[None]],dim=0).min(0)) * reward_collision
+        return (-10) * reward_target + (-30+20*torch.cat([up[None],down[None]],dim=0).min(0)[0]) * reward_collision
         
     def visualize_reward(self, state, action):
         dim_x = self.x_limits[1]-self.x_limits[0]
