@@ -113,6 +113,8 @@ class ActorCriticTrainer:
             critic_subiters: int = 1000,
             critic_batch_size: int = 1000,
             actor_batch_size: int = 1000,
+            actor_window: int = 2,
+            critic_window: int = 2,
             grad_clip_norm: Optional[float] = None,
             verbose: bool = False
     ):
@@ -134,7 +136,7 @@ class ActorCriticTrainer:
                 with torch.no_grad():
                     next_state = state
                     reward = 0
-                    for semi in range(2):
+                    for semi in range(critic_window):
                         action = actor(dynamics.system.get_observation(next_state))
                         reward += dynamics.system.get_reward(next_state,action) * dynamics.discount_factor**semi
                         
@@ -156,9 +158,15 @@ class ActorCriticTrainer:
             for i in pbar:
                 state = dynamics.system.sample_state(actor_batch_size)
                 
-                action = actor(dynamics.system.get_observation(state))
-                next_state = dynamics.make_transition(state, action)
-                actor_loss = dynamics.actor_loss(state, action, next_state)
+                next_state = state
+                reward = 0
+                for semi in range(actor_window):
+                    action = actor(dynamics.system.get_observation(next_state.detach()))
+                    next_state = dynamics.make_transition(next_state.detach(), action)
+                    
+                    reward += dynamics.get_reward(next_state,action) * dynamics.discount_factor ** semi
+                    
+                actor_loss = -(reward + dynamics.discount_factor ** (semi+1) * critic(dynamics.get_observation(next_state))).mean()
 
                 actor_optimizer.zero_grad()
                 actor_loss.backward()

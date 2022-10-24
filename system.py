@@ -81,6 +81,7 @@ class System(torch.nn.Module):
                                  d==4)
     def check_pass_block(self,c_x,phi,x,w):
         return c_x+self.l[0]*torch.cos(phi)/2+self.l[1]*torch.sin(torch.abs(phi))/2 < x-w/2
+
     def get_observation(self, state):
         state = state.t()
         c_x, c_y, v_x, v_y, phi, _, _ = state
@@ -88,7 +89,9 @@ class System(torch.nn.Module):
         down = c_y - self.y_limits[0] - self.l[0]*torch.sin(torch.abs(phi))/2 - self.l[1]*torch.cos(phi)/2
         d_1 = torch.ones_like(c_x) * 4
         d_2 = torch.ones_like(c_x) * 4
-        d_target = (self.target[0]-c_x) / (self.x_limits[1] - self.x_limits[0])
+#         d_target = (self.target[0]-c_x) / (self.x_limits[1] - self.x_limits[0])
+        d_target = torch.sign(self.target[0]-c_x)
+        hist_check_pass = c_x < -np.infty
         for i,block in enumerate(self.blocks):
             x,y,w,h = block
             x_check_in = self.x_check_in_block(c_x,phi,x,w)
@@ -99,22 +102,35 @@ class System(torch.nn.Module):
             d_1[y1_check_in] = 0
             d_2[y2_check_in] = 0
             
-            y1_check_pass = torch.logical_and(self.check_pass_block(c_x,phi,x,w), self.y1_check_in_block(c_y,phi,y,h,d_1))
-            y2_check_pass = torch.logical_and(self.check_pass_block(c_x,phi,x,w), self.y2_check_in_block(c_y,phi,y,h,d_2))
+            check_pass = torch.logical_and(torch.logical_not(hist_check_pass),self.check_pass_block(c_x,phi,x,w))
+            hist_check_pass = torch.logical_or(hist_check_pass,self.check_pass_block(c_x,phi,x,w))
+            y1_check_pass = torch.logical_and(check_pass, self.y1_check_in_block(c_y,phi,y,h,d_1))
+            y2_check_pass = torch.logical_and(check_pass, self.y2_check_in_block(c_y,phi,y,h,d_2))
+            
             
             d_1[y1_check_pass] = (x - w/2 - c_x - torch.cos(phi)*self.l[0]/2 - torch.sin(torch.abs(phi))*self.l[1]/2)[y1_check_pass]
             d_2[y2_check_pass] = (x - w/2 - c_x - torch.cos(phi)*self.l[0]/2 - torch.sin(torch.abs(phi))*self.l[1]/2)[y2_check_pass]
-        
-        return torch.cat([d_target[None],d_1[None],d_2[None],up[None],down[None], phi[None],v_x[None],v_y[None]],dim=0).t()
+            
+            d_1[torch.logical_and(c_y >= y, y1_check_pass)] += 0.01
+            d_2[torch.logical_and(c_y < y, y2_check_pass)] += 0.01
+            
+        new_d_1 = torch.cat([d_1[None],d_2[None]],0).min(0)[0]
+        new_d_2 = d_2 - d_1
+        return torch.cat([d_target[None],new_d_1[None],new_d_2[None],up[None],down[None], phi[None],v_x[None],v_y[None]],dim=0).t()
     def get_reward(self,state,action):
+        c_x = state.t()[0]
         observation = self.get_observation(state).t()
-        d_target, d_1, d_2, up, down, phi, _, _ = observation
+        _, d_1, d_2, up, down, phi, _, _ = observation
+        d_target = (self.target[0]-c_x) / (self.x_limits[1] - self.x_limits[0])
         u_1, u_2 = action.t()
-        vert_dist = torch.cat([up[None],down[None]],dim=0).min(0)[0].clamp(0,10)
-        hori_dist = torch.cat([d_1[None],d_2[None]],dim=0).min(0)[0]
+        vert_dist = torch.cat([up[None],down[None]],dim=0).min(0)[0][None] - 0.001
+        hori_dist = d_1[None] - 0.002
+        left = (c_x-self.x_limits[0]-self.l[0]/4-0.001)[None]
+        right = (self.x_limits[1]-c_x-self.l[0]/4-0.001)[None]
+        min_val = torch.cat([vert_dist,hori_dist,left,right],dim=0).min(0)[0]
         reward_target = (-1) * (d_target)**2 / (self.x_limits[1] - self.x_limits[0])**2
-        reward_collision = (-10)*torch.nn.Sigmoid()(-1000*(vert_dist-0.001)) + (-10)*torch.nn.Sigmoid()(-1000*(hori_dist-0.001))
-        return reward_target + reward_collision
+        reward_collision = (-10) * torch.nn.Sigmoid()(-1000*min_val)
+        return reward_target + reward_collision + (-1) * (phi / (np.pi/8))**4
         
     def visualize_reward(self, state, action):
         dim_x = self.x_limits[1]-self.x_limits[0]
@@ -143,7 +159,7 @@ class System(torch.nn.Module):
         state = self.init_state()
         fig = plt.figure(figsize=(dim_x*4,dim_y*4))
         axes = plt.gca()
-        scale = 5
+        scale = 10
         num_x, num_y = int(dim_x*4*scale), int(dim_y*4*scale)
         all_states = state.repeat(num_x * num_y, 1)
         all_states[:, 0] = torch.linspace(self.x_limits[0], self.x_limits[1], num_x, device=self.device).repeat(num_y)
