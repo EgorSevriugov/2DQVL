@@ -2,9 +2,9 @@ from collections import defaultdict
 from typing import Optional, Union, Type, Dict
 
 import torch
+from tqdm import tqdm
 
 from system import DynamicSystem
-from tqdm import tqdm
 
 
 class Scale(torch.nn.Module):
@@ -83,7 +83,7 @@ class Critic(torch.nn.Module):
         self.net = torch.nn.Sequential(*modules)
 
     def forward(self, observation):
-        x = observation[:,:-2]
+        x = observation[:, :-2]
         x = self.net(x)
         out = -x
         return out
@@ -143,18 +143,18 @@ class ActorCriticTrainer:
             total_critic_loss = 0.
             pbar = tqdm(range(critic_subiters))
             for i in pbar:
-
                 state = dynamics.system.sample_state(critic_batch_size)
                 with torch.no_grad():
                     next_state = state
                     reward = 0
                     for semi in range(critic_td_steps):
                         action = actor(dynamics.system.get_observation(next_state))
-                        reward += dynamics.system.get_reward(next_state,action) * dynamics.discount_factor**semi
-                        
+                        reward += dynamics.system.get_reward(next_state, action) * dynamics.discount_factor ** semi
+
                         next_state = dynamics.make_transition(next_state, action)
-                    target = reward[:,None] + (dynamics.discount_factor**critic_td_steps) * critic(dynamics.get_observation(next_state))
-                critic_loss = torch.nn.MSELoss()(critic(dynamics.get_observation(state)),target)
+                    target = reward[:, None] + (dynamics.discount_factor ** critic_td_steps) \
+                        * critic(dynamics.get_observation(next_state))
+                critic_loss = torch.nn.MSELoss()(critic(dynamics.get_observation(state)), target)
 
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
@@ -180,7 +180,7 @@ class ActorCriticTrainer:
                     init_state = state.detach()
                 else:
                     state = dynamics.system.sample_state(actor_batch_size)
-                
+
                 next_state = state
                 reward = 0
                 for semi in range(actor_horizon):
@@ -189,7 +189,8 @@ class ActorCriticTrainer:
 
                     next_state = dynamics.make_transition(next_state, action)
 
-                actor_loss = -(reward + dynamics.discount_factor ** actor_horizon * critic(dynamics.system.get_observation(next_state))).mean()
+                actor_loss = -(reward + dynamics.discount_factor ** actor_horizon
+                               * critic(dynamics.system.get_observation(next_state))).mean()
 
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
