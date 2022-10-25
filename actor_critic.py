@@ -4,7 +4,6 @@ from typing import Optional, Union, Type, Dict
 import torch
 
 from system import DynamicSystem
-import numpy as np
 from tqdm import tqdm
 
 
@@ -20,13 +19,24 @@ class Scale(torch.nn.Module):
         return f'factor={self.factor}'
 
 
+class Head(torch.nn.Module):
+    def __init__(self):
+        super(self.__class__, self).__init__()
+
+    def forward(self, input):
+        norm = torch.matmul(input.reshape(input.shape[0], 1, input.shape[1]),
+                            input.reshape(input.shape[0], input.shape[1], 1)).squeeze(1) ** 0.5
+        return input * (torch.tanh(norm) / norm)
+
+
 class Actor(torch.nn.Module):
     def __init__(
             self,
             num_observations: int = 8,
             num_actions: int = 2,
             dim: int = 32,
-            depth: int = 3
+            depth: int = 3,
+            scale: float = 1.
     ):
         super().__init__()
 
@@ -36,13 +46,18 @@ class Actor(torch.nn.Module):
                 num_observations if i == 0 else dim,
                 num_actions if i == depth - 1 else dim
             ))
-            modules.append(torch.nn.LeakyReLU() if i < depth - 1 else torch.nn.Identity())
+            # modules.append(torch.nn.LeakyReLU() if i < depth - 1 else torch.nn.Tanh())
+            if i < depth - 1:
+                modules.append(torch.nn.LeakyReLU())
+        modules.append(Head())
+        modules.append(Scale(scale))
 
         self.net = torch.nn.Sequential(*modules)
 
     def forward(self, observation):
         x = observation
-        out = torch.nn.Tanh()(self.net(x))*0.5 + 0.5
+        out = self.net(x)
+        out = torch.abs(out)
         return out
 
 
@@ -62,9 +77,7 @@ class Critic(torch.nn.Module):
                 num_observations if i == 0 else dim,
                 1 if i == depth - 1 else dim
             ))
-            if i < depth - 1:
-                modules.append(torch.nn.LeakyReLU())
-        modules.append(torch.nn.Tanh())
+            modules.append(torch.nn.LeakyReLU() if i < depth - 1 else torch.nn.Tanh())
         modules.append(Scale(scale))
 
         self.net = torch.nn.Sequential(*modules)
@@ -104,7 +117,6 @@ class ActorCriticTrainer:
         else:
             critic_optimizer_params = critic_optimizer_params or {}
             self.critic_optimizer = critic_optimizer(self.critic.parameters(), **critic_optimizer_params)
-            
 
     def run(
             self,
@@ -113,10 +125,10 @@ class ActorCriticTrainer:
             critic_subiters: int = 1000,
             critic_batch_size: int = 1000,
             actor_batch_size: int = 1000,
-            actor_window: int = 2,
-            critic_window: int = 2,
-            grad_clip_norm: Optional[float] = None,
-            verbose: bool = False
+            critic_td_steps: int = 2,
+            actor_horizon: int = 1,
+            episodic_training: bool = False,
+            grad_clip_norm: Optional[float] = None
     ):
         dynamics = self.dynamics
         actor, critic = dynamics.actor, dynamics.critic
@@ -124,11 +136,11 @@ class ActorCriticTrainer:
         actor_optimizer, critic_optimizer = self.actor_optimizer, self.critic_optimizer
         assert actor_optimizer is not None and critic_optimizer is not None, \
             'Actor/Critic optimizers are not initialized, run `init_optimizers`'
-        actor_grad_norm = critic_grad_norm = None
 
         training_history = defaultdict(list)
 
         for iteration in range(self.total_iterations, self.total_iterations + iterations):
+            total_critic_loss = 0.
             pbar = tqdm(range(critic_subiters))
             for i in pbar:
 
@@ -136,47 +148,60 @@ class ActorCriticTrainer:
                 with torch.no_grad():
                     next_state = state
                     reward = 0
-                    for semi in range(critic_window):
+                    for semi in range(critic_td_steps):
                         action = actor(dynamics.system.get_observation(next_state))
                         reward += dynamics.system.get_reward(next_state,action) * dynamics.discount_factor**semi
                         
                         next_state = dynamics.make_transition(next_state, action)
-                    target = reward[:,None] + (dynamics.discount_factor**(semi+1)) * critic(dynamics.get_observation(next_state))
+                    target = reward[:,None] + (dynamics.discount_factor**critic_td_steps) * critic(dynamics.get_observation(next_state))
                 critic_loss = torch.nn.MSELoss()(critic(dynamics.get_observation(state)),target)
 
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
                 if grad_clip_norm is not None:
-                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic.parameters(), grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), grad_clip_norm)
                 critic_optimizer.step()
-                if i % 10 == 0:
+                total_critic_loss += critic_loss.item()
+                if (i + 1) % 10 == 0 or i + 1 == critic_subiters:
                     pbar.set_description(
-                        f"Iteration {i}"
-                        f"Loss {round(critic_loss.item())}"
+                        f"Critic: Iteration {i + 1}, "
+                        f"Loss {critic_loss.item():.3f}, "
+                        f"Mean Loss {total_critic_loss / (i + 1):.3f}"
                     )
+
+            total_actor_loss = 0.
             pbar = tqdm(range(actor_subiters))
+
+            init_state = dynamics.system.sample_state(actor_batch_size).detach()
             for i in pbar:
-                state = dynamics.system.sample_state(actor_batch_size)
+                if episodic_training:
+                    action = actor(dynamics.system.get_observation(init_state))
+                    state = dynamics.make_transition(init_state, action)
+                    init_state = state.detach()
+                else:
+                    state = dynamics.system.sample_state(actor_batch_size)
                 
                 next_state = state
                 reward = 0
-                for semi in range(actor_window):
-                    action = actor(dynamics.system.get_observation(next_state.detach()))
-                    next_state = dynamics.make_transition(next_state.detach(), action)
-                    
-                    reward += dynamics.get_reward(next_state,action) * dynamics.discount_factor ** semi
-                    
-                actor_loss = -(reward + dynamics.discount_factor ** (semi+1) * critic(dynamics.get_observation(next_state))).mean()
+                for semi in range(actor_horizon):
+                    action = actor(dynamics.system.get_observation(next_state))
+                    reward += dynamics.system.get_reward(next_state, action) * dynamics.discount_factor ** semi
+
+                    next_state = dynamics.make_transition(next_state, action)
+
+                actor_loss = -(reward + dynamics.discount_factor ** actor_horizon * critic(dynamics.system.get_observation(next_state))).mean()
 
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 if grad_clip_norm is not None:
-                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip_norm)
                 actor_optimizer.step()
-                if i % 10 == 0:
+                total_actor_loss += actor_loss.item()
+                if (i + 1) % 10 == 0 or i + 1 == actor_subiters:
                     pbar.set_description(
-                        f"Iteration {i}"
-                        f"Loss {round(actor_loss.item())}"
+                        f"Actor: Iteration {i + 1}, "
+                        f"Loss {actor_loss.item():.3f}, "
+                        f"Mean Loss {total_actor_loss / (i + 1):.3f}"
                     )
 
         self.total_iterations += iterations

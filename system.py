@@ -129,7 +129,7 @@ class System(torch.nn.Module):
         right = (self.x_limits[1]-c_x-self.l[0]/4-0.001)[None]
         min_val = torch.cat([vert_dist,hori_dist,left,right],dim=0).min(0)[0]
         reward_target = (-1) * (d_target)**2 / (self.x_limits[1] - self.x_limits[0])**2
-        reward_collision = (-10) * torch.nn.Sigmoid()(-1000*min_val)
+        reward_collision = (-10) * torch.sigmoid(-1000*min_val)
         return reward_target + reward_collision + (-1) * (phi / (np.pi/8))**4
         
     def visualize_reward(self, state, action):
@@ -147,10 +147,8 @@ class System(torch.nn.Module):
         _ = plt.xticks([])
         _ = plt.yticks([])
         plt.close(fig)
-        buf = io.BytesIO()
-        fig.savefig(buf)
-        buf.seek(0)
-        img = Image.open(buf)
+        fig.canvas.draw()
+        img = Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
         return img
     
     def visualize_critic(self, critic):
@@ -167,6 +165,29 @@ class System(torch.nn.Module):
         with torch.no_grad():
             result = critic(self.get_observation(all_states)).view(num_y, num_x).cpu()
         im = axes.imshow(result,cmap=mpl.colormaps["viridis"])
+        _ = plt.xticks([])
+        _ = plt.yticks([])
+        plt.close(fig)
+        fig.canvas.draw()
+        img = Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
+        return img
+
+    def visualize_actor(self, actor, critic):
+        dim_x = self.x_limits[1]-self.x_limits[0]
+        dim_y = self.y_limits[1]-self.y_limits[0]
+        state = self.init_state()
+        fig = plt.figure(figsize=(dim_x*4,dim_y*4))
+        axes = plt.gca()
+        scale = 3
+        num_x, num_y = int(dim_x*4*scale), int(dim_y*4*scale)
+        all_states = state.repeat(num_x * num_y, 1)
+        all_states[:, 0] = torch.linspace(self.x_limits[0], self.x_limits[1], num_x, device=self.device).repeat(num_y)
+        all_states[:, 1] = torch.linspace(self.y_limits[1], self.y_limits[0], num_y, device=self.device).repeat_interleave(num_x)
+        with torch.no_grad():
+            actor_out = actor(self.get_observation(all_states)).view(num_y, num_x, 2).cpu()
+            critic_out = critic(self.get_observation(all_states)).view(num_y, num_x).cpu()
+        im = axes.imshow(critic_out,cmap=mpl.colormaps["viridis"])
+        axes.quiver(actor_out[:, :, 0], actor_out[:, :, 1])
         _ = plt.xticks([])
         _ = plt.yticks([])
         plt.close(fig)
@@ -244,12 +265,8 @@ class System(torch.nn.Module):
         plt.title("c_y",fontsize=18)
         
         plt.close(fig)
-        
-        
-        buf = io.BytesIO()
-        fig.savefig(buf)
-        buf.seek(0)
-        img = Image.open(buf)
+        fig.canvas.draw()
+        img = Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
         return img
             
     def init_state(self):
@@ -260,8 +277,8 @@ class System(torch.nn.Module):
         _, _, _, _, _,theta, wind = state
         c_x = torch.rand((1,batch_size), device=self.device) * (self.x_limits[1]-self.x_limits[0]) + self.x_limits[0]
         c_y = torch.rand((1,batch_size), device=self.device) * (self.y_limits[1]-self.y_limits[0]) + self.y_limits[0]
-        v_x = torch.rand((1,batch_size), device=self.device) * 2
-        v_y = torch.rand((1,batch_size), device=self.device) * 1
+        v_x = torch.rand((1,batch_size), device=self.device) * 3 - 1
+        v_y = torch.rand((1,batch_size), device=self.device) * 2 - 1
         phi = torch.rand((1,batch_size), device=self.device) * (np.pi/3) - np.pi/6
         state = torch.cat([c_x,c_y,v_x,v_y,phi,theta[None],wind[None]],dim=0).t()
         return state
